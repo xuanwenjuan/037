@@ -140,11 +140,22 @@ func (c *ResultConsumer) processResult(result *models.WorkerResultMessage) error
 		}
 
 	case models.StatusCompleted:
-		if result.Moisture != nil {
-			if err := c.repo.UpdateMoistureResult(result.AnalysisID, *result.Moisture); err != nil {
-				return err
-			}
-			progressMsg.Data = map[string]float64{"moisture_content_percent": *result.Moisture}
+		if err := c.repo.SaveCompleteResult(result); err != nil {
+			return err
+		}
+		progressMsg.Data = map[string]interface{}{
+			"moisture_content_percent": result.Moisture,
+			"anomaly_detection":        result.AnomalyDetection,
+			"performance":              result.Performance,
+		}
+
+	case models.StatusInvalid:
+		if err := c.repo.SaveInvalidResult(result); err != nil {
+			return err
+		}
+		progressMsg.Data = map[string]interface{}{
+			"anomaly_detection": result.AnomalyDetection,
+			"is_invalid":        true,
 		}
 
 	case models.StatusFailed:

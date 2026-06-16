@@ -1,15 +1,25 @@
 import os
+import time
 import numpy as np
 import onnxruntime as ort
 from typing import Dict, List, Optional
 
+from .band_cutter import BandCutter
+
 
 class PLSRPredictor:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, use_band_cutting: bool = True):
         self.model_path = model_path
         self.session = None
         self.input_name = None
         self.output_name = None
+        self.use_band_cutting = use_band_cutting
+        self.band_cutter = BandCutter(
+            min_freq_thz=0.1,
+            max_freq_thz=4.0,
+            snr_threshold=3.0,
+        )
+        self._target_freqs = np.array([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]) * 1e12
         self._load_model()
 
     def _load_model(self) -> None:
@@ -43,12 +53,62 @@ class PLSRPredictor:
         absorption_coeff: List[float],
         refractive_index: List[float],
     ) -> float:
-        features = self._extract_features(frequencies, absorption_coeff, refractive_index)
+        result = self.predict_with_details(
+            frequencies, absorption_coeff, refractive_index
+        )
+        return result["moisture_content"]
+
+    def predict_with_details(
+        self,
+        frequencies: List[float],
+        absorption_coeff: List[float],
+        refractive_index: List[float],
+    ) -> Dict:
+        start_time = time.time()
+
+        if self.use_band_cutting:
+            cut_result = self.band_cutter.cut_params(
+                frequencies, absorption_coeff, refractive_index
+            )
+            cut_freqs = cut_result["frequencies"]
+            cut_alpha = cut_result["absorption_coeff"]
+            cut_n = cut_result["refractive_index"]
+            band_info = cut_result["band_info"]
+            speedup_ratio = cut_result["speedup_ratio"]
+
+            if not band_info["valid"] or len(cut_freqs) < 5:
+                return {
+                    "moisture_content": 0.0,
+                    "valid": False,
+                    "band_info": band_info,
+                    "processing_time_ms": 0.0,
+                    "speedup_ratio": 1.0,
+                    "error": "No valid frequency band for prediction",
+                }
+        else:
+            cut_freqs = frequencies
+            cut_alpha = absorption_coeff
+            cut_n = refractive_index
+            band_info = None
+            speedup_ratio = 1.0
+
+        features = self._extract_features(cut_freqs, cut_alpha, cut_n)
 
         if self.session is not None:
-            return self._predict_onnx(features)
+            moisture = self._predict_onnx(features)
         else:
-            return self._predict_fallback(frequencies, absorption_coeff, refractive_index)
+            moisture = self._predict_fallback_from_features(features)
+
+        processing_time = (time.time() - start_time) * 1000
+
+        return {
+            "moisture_content": moisture,
+            "valid": True,
+            "band_info": band_info,
+            "processing_time_ms": processing_time,
+            "speedup_ratio": speedup_ratio,
+            "feature_dim": features.shape[1],
+        }
 
     def _extract_features(
         self,
@@ -60,10 +120,8 @@ class PLSRPredictor:
         alpha_arr = np.array(absorption_coeff)
         n_arr = np.array(refractive_index)
 
-        target_freqs = np.array([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]) * 1e12
-
-        alpha_interp = self._interpolate(freq_arr, alpha_arr, target_freqs)
-        n_interp = self._interpolate(freq_arr, n_arr, target_freqs)
+        alpha_interp = self._interpolate(freq_arr, alpha_arr, self._target_freqs)
+        n_interp = self._interpolate(freq_arr, n_arr, self._target_freqs)
 
         alpha_stats = self._compute_stats(alpha_arr)
         n_stats = self._compute_stats(n_arr)
@@ -147,3 +205,24 @@ class PLSRPredictor:
         for freqs, alpha, n in zip(frequencies_list, alpha_list, n_list):
             results.append(self.predict(freqs, alpha, n))
         return results
+
+    def get_sensitive_bands(
+        self,
+        frequencies: List[float],
+        absorption_coeff: List[float],
+        refractive_index: List[float],
+        num_bands: int = 5,
+    ) -> List[Dict]:
+        return self.band_cutter.select_sensitive_bands(
+            frequencies, absorption_coeff, refractive_index, num_bands=num_bands
+        )
+
+    def get_band_info(
+        self,
+        frequencies: List[float],
+        amplitude: List[float],
+        reference_amplitude: Optional[List[float]] = None,
+    ) -> Dict:
+        return self.band_cutter.find_valid_band(
+            frequencies, amplitude, reference_amplitude
+        )

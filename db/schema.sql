@@ -9,7 +9,17 @@ CREATE TABLE IF NOT EXISTS analyses (
     error_message TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE,
-    moisture_content_percent FLOAT
+    moisture_content_percent FLOAT,
+    is_valid BOOLEAN DEFAULT TRUE,
+    anomaly_score FLOAT,
+    anomaly_confidence FLOAT,
+    anomaly_severity VARCHAR(20),
+    anomaly_reasons JSONB,
+    anomaly_types JSONB,
+    band_start_freq_thz FLOAT,
+    band_end_freq_thz FLOAT,
+    total_speedup_ratio FLOAT,
+    prediction_time_ms FLOAT
 );
 
 CREATE TABLE IF NOT EXISTS raw_waveforms (
@@ -44,6 +54,8 @@ CREATE TABLE IF NOT EXISTS optical_params (
 
 CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status);
 CREATE INDEX IF NOT EXISTS idx_analyses_created ON analyses(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analyses_is_valid ON analyses(is_valid);
+CREATE INDEX IF NOT EXISTS idx_analyses_anomaly_severity ON analyses(anomaly_severity);
 CREATE INDEX IF NOT EXISTS idx_waveforms_analysis ON raw_waveforms(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_spectra_analysis ON frequency_spectra(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_params_analysis ON optical_params(analysis_id);

@@ -36,9 +36,12 @@ func (r *Repository) UpdateAnalysisStatus(analysisID string, status models.Analy
 	if errMsg != "" {
 		updates["error_message"] = errMsg
 	}
-	if status == models.StatusCompleted || status == models.StatusFailed {
+	if status == models.StatusCompleted || status == models.StatusFailed || status == models.StatusInvalid {
 		now := time.Now()
 		updates["completed_at"] = &now
+	}
+	if status == models.StatusInvalid {
+		updates["is_valid"] = false
 	}
 	return r.db.Model(&models.Analysis{}).Where("id = ?", analysisID).Updates(updates).Error
 }
@@ -184,4 +187,151 @@ func (r *Repository) SaveParamsResult(analysisID string, params *models.ParamsRe
 		return tx.Model(&models.Analysis{}).Where("id = ?", analysisID).
 			Update("status", models.StatusParamsDone).Error
 	})
+}
+
+func (r *Repository) SaveCompleteResult(result *models.WorkerResultMessage) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]interface{}{
+			"status":      models.StatusCompleted,
+			"is_valid":    true,
+			"completed_at": time.Now(),
+		}
+
+		if result.Moisture != nil {
+			updates["moisture_content_percent"] = *result.Moisture
+		}
+
+		if result.AnomalyDetection != nil {
+			updates["anomaly_score"] = result.AnomalyDetection.AnomalyScore
+			updates["anomaly_confidence"] = result.AnomalyDetection.Confidence
+			updates["anomaly_severity"] = result.AnomalyDetection.Severity
+
+			if len(result.AnomalyDetection.Reasons) > 0 {
+				reasonsJSON, _ := json.Marshal(result.AnomalyDetection.Reasons)
+				updates["anomaly_reasons"] = datatypes.JSON(reasonsJSON)
+			}
+
+			typesJSON, _ := json.Marshal(result.AnomalyDetection.AnomalyType)
+			updates["anomaly_types"] = datatypes.JSON(typesJSON)
+		}
+
+		if result.Performance != nil {
+			updates["total_speedup_ratio"] = result.Performance.TotalSpeedup
+			updates["prediction_time_ms"] = result.Performance.PredictionTimeMs
+		}
+
+		if result.FFT != nil && result.FFT.BandInfo != nil {
+			updates["band_start_freq_thz"] = result.FFT.BandInfo.StartFreqHz / 1e12
+			updates["band_end_freq_thz"] = result.FFT.BandInfo.EndFreqHz / 1e12
+		}
+
+		return tx.Model(&models.Analysis{}).Where("id = ?", result.AnalysisID).Updates(updates).Error
+	})
+}
+
+func (r *Repository) SaveInvalidResult(result *models.WorkerResultMessage) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]interface{}{
+			"status":       models.StatusInvalid,
+			"is_valid":     false,
+			"completed_at": time.Now(),
+		}
+
+		if result.AnomalyDetection != nil {
+			updates["anomaly_score"] = result.AnomalyDetection.AnomalyScore
+			updates["anomaly_confidence"] = result.AnomalyDetection.Confidence
+			updates["anomaly_severity"] = result.AnomalyDetection.Severity
+
+			if len(result.AnomalyDetection.Reasons) > 0 {
+				reasonsJSON, _ := json.Marshal(result.AnomalyDetection.Reasons)
+				updates["anomaly_reasons"] = datatypes.JSON(reasonsJSON)
+			}
+
+			typesJSON, _ := json.Marshal(result.AnomalyDetection.AnomalyType)
+			updates["anomaly_types"] = datatypes.JSON(typesJSON)
+		}
+
+		if result.Error != "" {
+			updates["error_message"] = result.Error
+		}
+
+		if result.FFT != nil && result.FFT.BandInfo != nil {
+			updates["band_start_freq_thz"] = result.FFT.BandInfo.StartFreqHz / 1e12
+			updates["band_end_freq_thz"] = result.FFT.BandInfo.EndFreqHz / 1e12
+		}
+
+		if err := tx.Model(&models.Analysis{}).Where("id = ?", result.AnalysisID).Updates(updates).Error; err != nil {
+			return err
+		}
+
+		if result.FFT != nil {
+			if err := r.upsertFFTResult(tx, result.AnalysisID, result.FFT); err != nil {
+				return err
+			}
+		}
+
+		if result.Params != nil {
+			if err := r.upsertParamsResult(tx, result.AnalysisID, result.Params); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
+func (r *Repository) upsertFFTResult(tx *gorm.DB, analysisID string, fft *models.FFTResult) error {
+	var existing models.FrequencySpectrum
+	err := tx.Where("analysis_id = ?", analysisID).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+
+	freqJSON, _ := json.Marshal(fft.Frequencies)
+	ampJSON, _ := json.Marshal(fft.SampleAmplitude)
+	phaseJSON, _ := json.Marshal(fft.SamplePhase)
+
+	fs := &models.FrequencySpectrum{
+		AnalysisID:      analysisID,
+		Frequencies:     datatypes.JSON(freqJSON),
+		SampleAmplitude: datatypes.JSON(ampJSON),
+		SamplePhase:     datatypes.JSON(phaseJSON),
+	}
+
+	if fft.ReferenceAmplitude != nil {
+		refAmpJSON, _ := json.Marshal(fft.ReferenceAmplitude)
+		fs.ReferenceAmplitude = datatypes.JSON(refAmpJSON)
+	}
+	if fft.ReferencePhase != nil {
+		refPhaseJSON, _ := json.Marshal(fft.ReferencePhase)
+		fs.ReferencePhase = datatypes.JSON(refPhaseJSON)
+	}
+
+	return tx.Create(fs).Error
+}
+
+func (r *Repository) upsertParamsResult(tx *gorm.DB, analysisID string, params *models.ParamsResult) error {
+	var existing models.OpticalParam
+	err := tx.Where("analysis_id = ?", analysisID).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+
+	freqJSON, _ := json.Marshal(params.Frequencies)
+	alphaJSON, _ := json.Marshal(params.AbsorptionCoeff)
+	nJSON, _ := json.Marshal(params.RefractiveIndex)
+
+	op := &models.OpticalParam{
+		AnalysisID:      analysisID,
+		Frequencies:     datatypes.JSON(freqJSON),
+		AbsorptionCoeff: datatypes.JSON(alphaJSON),
+		RefractiveIndex: datatypes.JSON(nJSON),
+	}
+
+	if params.ExtinctionCoeff != nil {
+		kJSON, _ := json.Marshal(params.ExtinctionCoeff)
+		op.ExtinctionCoeff = datatypes.JSON(kJSON)
+	}
+
+	return tx.Create(op).Error
 }

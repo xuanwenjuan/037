@@ -10,7 +10,7 @@ from typing import Dict, Optional
 import pika
 from config import config
 
-from algorithms import FFTProcessor, DorneyDuvillaret, PLSRPredictor
+from algorithms import FFTProcessor, DorneyDuvillaret, PLSRPredictor, BandCutter, AnomalyDetector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,9 +21,16 @@ class THZWorker:
         self.channel = None
         self.fft_processor = FFTProcessor()
         self.dorney = DorneyDuvillaret()
-        self.plsr_predictor = PLSRPredictor(config.ONNX_MODEL_PATH)
+        self.plsr_predictor = PLSRPredictor(config.ONNX_MODEL_PATH, use_band_cutting=True)
+        self.band_cutter = BandCutter(
+            min_freq_thz=0.1,
+            max_freq_thz=4.0,
+            snr_threshold=3.0,
+        )
+        self.anomaly_detector = AnomalyDetector(contamination=0.1)
         self.running = False
         self.threads = []
+        self._valid_sample_count = 0
 
     def connect(self):
         params = pika.URLParameters(config.RABBITMQ_URL)
@@ -113,8 +120,21 @@ class THZWorker:
             self.send_progress(
                 analysis_id,
                 "processing",
+                3,
+                "Starting waveform quality check",
+            )
+
+            anomaly_result = self.anomaly_detector.detect_anomaly(
+                time=waveform["time"],
+                field=waveform["sample_field"],
+                sample_thickness_mm=sample_thickness,
+            )
+
+            self.send_progress(
+                analysis_id,
+                "processing",
                 5,
-                "Starting waveform processing",
+                "Waveform quality check completed",
             )
 
             self.send_progress(
@@ -130,20 +150,48 @@ class THZWorker:
                 reference_field=waveform.get("reference_field"),
             )
 
+            self.send_progress(
+                analysis_id,
+                "processing",
+                20,
+                "Performing intelligent band cutting",
+            )
+
+            cut_spectrum = self.band_cutter.cut_spectrum(
+                frequencies=fft_result["frequencies"],
+                sample_amp=fft_result["sample_amplitude"],
+                sample_phase=fft_result["sample_phase"],
+                reference_amp=fft_result.get("reference_amplitude"),
+                reference_phase=fft_result.get("reference_phase"),
+            )
+
+            band_info = cut_spectrum["band_info"]
+            speedup_fft = cut_spectrum["speedup_ratio"]
+
             fft_output = {
-                "frequencies": fft_result["frequencies"],
-                "sample_amplitude": fft_result["sample_amplitude"],
-                "sample_phase": fft_result["sample_phase"],
-                "reference_amplitude": fft_result.get("reference_amplitude"),
-                "reference_phase": fft_result.get("reference_phase"),
+                "frequencies": cut_spectrum["frequencies"],
+                "sample_amplitude": cut_spectrum["sample_amplitude"],
+                "sample_phase": cut_spectrum["sample_phase"],
+                "reference_amplitude": cut_spectrum.get("reference_amplitude"),
+                "reference_phase": cut_spectrum.get("reference_phase"),
+                "band_info": band_info,
+                "speedup_ratio": float(speedup_fft),
             }
 
             self.send_progress(
                 analysis_id,
                 "fft_done",
                 40,
-                "FFT transformation completed",
+                f"FFT transformation completed, valid band: {band_info.get('start_freq_hz', 0)/1e12:.2f}-{band_info.get('end_freq_hz', 0)/1e12:.2f} THz",
                 fft=fft_output,
+            )
+
+            anomaly_result = self.anomaly_detector.detect_anomaly(
+                time=waveform["time"],
+                field=waveform["sample_field"],
+                frequencies=cut_spectrum["frequencies"],
+                amplitude=cut_spectrum["sample_amplitude"],
+                sample_thickness_mm=sample_thickness,
             )
 
             self.send_progress(
@@ -154,11 +202,11 @@ class THZWorker:
             )
 
             params_result = self.dorney.extract_parameters(
-                frequencies=fft_result["frequencies"],
-                sample_amp=fft_result["sample_amplitude"],
-                sample_phase=fft_result["sample_phase"],
-                reference_amp=fft_result.get("reference_amplitude"),
-                reference_phase=fft_result.get("reference_phase"),
+                frequencies=cut_spectrum["frequencies"],
+                sample_amp=cut_spectrum["sample_amplitude"],
+                sample_phase=cut_spectrum["sample_phase"],
+                reference_amp=cut_spectrum.get("reference_amplitude"),
+                reference_phase=cut_spectrum.get("reference_phase"),
                 sample_thickness_mm=sample_thickness,
             )
 
@@ -167,6 +215,7 @@ class THZWorker:
                 "absorption_coeff": params_result["absorption_coeff"],
                 "refractive_index": params_result["refractive_index"],
                 "extinction_coeff": params_result.get("extinction_coeff"),
+                "band_info": band_info,
             }
 
             self.send_progress(
@@ -177,6 +226,42 @@ class THZWorker:
                 params=params_output,
             )
 
+            anomaly_result = self.anomaly_detector.detect_anomaly(
+                time=waveform["time"],
+                field=waveform["sample_field"],
+                frequencies=params_result["frequencies"],
+                amplitude=cut_spectrum["sample_amplitude"],
+                alpha=params_result["absorption_coeff"],
+                n=params_result["refractive_index"],
+                sample_thickness_mm=sample_thickness,
+            )
+
+            if anomaly_result["is_invalid"]:
+                print(f"Task {analysis_id}: Invalid sample detected - {anomaly_result['reasons']}")
+
+                invalid_result = {
+                    "analysis_id": analysis_id,
+                    "status": "invalid",
+                    "progress": 100,
+                    "stage": "Invalid sample detected",
+                    "anomaly_detection": {
+                        "is_invalid": True,
+                        "anomaly_score": anomaly_result["anomaly_score"],
+                        "confidence": anomaly_result["confidence"],
+                        "reasons": anomaly_result["reasons"],
+                        "anomaly_type": anomaly_result["anomaly_type"],
+                        "severity": anomaly_result["severity"],
+                    },
+                    "fft": fft_output,
+                    "params": params_output,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+                self.send_result(invalid_result)
+                return
+
+            self.anomaly_detector.update_reference(anomaly_result["features"])
+            self._valid_sample_count += 1
+
             self.send_progress(
                 analysis_id,
                 "processing",
@@ -184,21 +269,48 @@ class THZWorker:
                 "Predicting moisture content",
             )
 
-            moisture = self.plsr_predictor.predict(
+            prediction = self.plsr_predictor.predict_with_details(
                 frequencies=params_result["frequencies"],
                 absorption_coeff=params_result["absorption_coeff"],
                 refractive_index=params_result["refractive_index"],
             )
 
+            moisture = prediction["moisture_content"]
+            total_speedup = prediction.get("speedup_ratio", 1.0) * speedup_fft
+
             self.send_progress(
                 analysis_id,
                 "completed",
                 100,
-                "Analysis completed successfully",
+                f"Analysis completed successfully, speedup: {total_speedup:.1f}x",
                 moisture=moisture,
             )
 
-            print(f"Task {analysis_id} completed: moisture = {moisture:.4f}%")
+            final_result = {
+                "analysis_id": analysis_id,
+                "status": "completed",
+                "fft": fft_output,
+                "params": params_output,
+                "moisture_content_percent": moisture,
+                "anomaly_detection": {
+                    "is_invalid": False,
+                    "anomaly_score": anomaly_result["anomaly_score"],
+                    "confidence": anomaly_result["confidence"],
+                    "anomaly_type": anomaly_result["anomaly_type"],
+                    "severity": anomaly_result["severity"],
+                },
+                "performance": {
+                    "fft_speedup": float(speedup_fft),
+                    "prediction_speedup": float(prediction.get("speedup_ratio", 1.0)),
+                    "total_speedup": float(total_speedup),
+                    "prediction_time_ms": float(prediction.get("processing_time_ms", 0)),
+                    "valid_samples_processed": self._valid_sample_count,
+                },
+            }
+
+            self.send_result(final_result)
+
+            print(f"Task {analysis_id} completed: moisture = {moisture:.4f}%, speedup = {total_speedup:.1f}x")
 
         except Exception as e:
             print(f"Error processing task {analysis_id}: {e}")

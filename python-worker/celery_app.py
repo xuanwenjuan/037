@@ -9,7 +9,7 @@ import pika
 from celery import Celery
 from config import config
 
-from algorithms import FFTProcessor, DorneyDuvillaret, PLSRPredictor
+from algorithms import FFTProcessor, DorneyDuvillaret, PLSRPredictor, BandCutter, AnomalyDetector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,7 +36,10 @@ app.conf.update(
 
 fft_processor = FFTProcessor()
 dorney = DorneyDuvillaret()
-plsr_predictor = PLSRPredictor(config.ONNX_MODEL_PATH)
+plsr_predictor = PLSRPredictor(config.ONNX_MODEL_PATH, use_band_cutting=True)
+band_cutter = BandCutter(min_freq_thz=0.1, max_freq_thz=4.0, snr_threshold=3.0)
+anomaly_detector = AnomalyDetector(contamination=0.1)
+_valid_sample_count = 0
 
 
 def send_result(result_data: Dict) -> None:
@@ -93,6 +96,8 @@ def send_progress(
 
 @app.task(name="process_thz_waveform", bind=True, max_retries=3)
 def process_thz_waveform(self, task_data: Dict) -> Dict:
+    global _valid_sample_count
+
     analysis_id = task_data["analysis_id"]
     waveform = task_data["waveform"]
     sample_thickness = task_data["sample_thickness_mm"]
@@ -101,11 +106,22 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
         send_progress(
             analysis_id,
             "processing",
-            5,
-            "Starting waveform processing",
+            3,
+            "Starting waveform quality check",
         )
 
-        time.sleep(0.1)
+        anomaly_result = anomaly_detector.detect_anomaly(
+            time=waveform["time"],
+            field=waveform["sample_field"],
+            sample_thickness_mm=sample_thickness,
+        )
+
+        send_progress(
+            analysis_id,
+            "processing",
+            5,
+            "Waveform quality check completed",
+        )
 
         send_progress(
             analysis_id,
@@ -120,19 +136,39 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
             reference_field=waveform.get("reference_field"),
         )
 
+        send_progress(
+            analysis_id,
+            "processing",
+            20,
+            "Performing intelligent band cutting",
+        )
+
+        cut_spectrum = band_cutter.cut_spectrum(
+            frequencies=fft_result["frequencies"],
+            sample_amp=fft_result["sample_amplitude"],
+            sample_phase=fft_result["sample_phase"],
+            reference_amp=fft_result.get("reference_amplitude"),
+            reference_phase=fft_result.get("reference_phase"),
+        )
+
+        band_info = cut_spectrum["band_info"]
+        speedup_fft = cut_spectrum["speedup_ratio"]
+
         fft_output = {
-            "frequencies": fft_result["frequencies"],
-            "sample_amplitude": fft_result["sample_amplitude"],
-            "sample_phase": fft_result["sample_phase"],
-            "reference_amplitude": fft_result.get("reference_amplitude"),
-            "reference_phase": fft_result.get("reference_phase"),
+            "frequencies": cut_spectrum["frequencies"],
+            "sample_amplitude": cut_spectrum["sample_amplitude"],
+            "sample_phase": cut_spectrum["sample_phase"],
+            "reference_amplitude": cut_spectrum.get("reference_amplitude"),
+            "reference_phase": cut_spectrum.get("reference_phase"),
+            "band_info": band_info,
+            "speedup_ratio": float(speedup_fft),
         }
 
         send_progress(
             analysis_id,
             "fft_done",
             40,
-            "FFT transformation completed",
+            f"FFT transformation completed, valid band: {band_info.get('start_freq_hz', 0)/1e12:.2f}-{band_info.get('end_freq_hz', 0)/1e12:.2f} THz",
             fft=fft_output,
         )
 
@@ -144,11 +180,11 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
         )
 
         params_result = dorney.extract_parameters(
-            frequencies=fft_result["frequencies"],
-            sample_amp=fft_result["sample_amplitude"],
-            sample_phase=fft_result["sample_phase"],
-            reference_amp=fft_result.get("reference_amplitude"),
-            reference_phase=fft_result.get("reference_phase"),
+            frequencies=cut_spectrum["frequencies"],
+            sample_amp=cut_spectrum["sample_amplitude"],
+            sample_phase=cut_spectrum["sample_phase"],
+            reference_amp=cut_spectrum.get("reference_amplitude"),
+            reference_phase=cut_spectrum.get("reference_phase"),
             sample_thickness_mm=sample_thickness,
         )
 
@@ -157,6 +193,7 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
             "absorption_coeff": params_result["absorption_coeff"],
             "refractive_index": params_result["refractive_index"],
             "extinction_coeff": params_result.get("extinction_coeff"),
+            "band_info": band_info,
         }
 
         send_progress(
@@ -167,6 +204,42 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
             params=params_output,
         )
 
+        anomaly_result = anomaly_detector.detect_anomaly(
+            time=waveform["time"],
+            field=waveform["sample_field"],
+            frequencies=params_result["frequencies"],
+            amplitude=cut_spectrum["sample_amplitude"],
+            alpha=params_result["absorption_coeff"],
+            n=params_result["refractive_index"],
+            sample_thickness_mm=sample_thickness,
+        )
+
+        if anomaly_result["is_invalid"]:
+            print(f"Task {analysis_id}: Invalid sample detected - {anomaly_result['reasons']}")
+
+            invalid_result = {
+                "analysis_id": analysis_id,
+                "status": "invalid",
+                "progress": 100,
+                "stage": "Invalid sample detected",
+                "anomaly_detection": {
+                    "is_invalid": True,
+                    "anomaly_score": anomaly_result["anomaly_score"],
+                    "confidence": anomaly_result["confidence"],
+                    "reasons": anomaly_result["reasons"],
+                    "anomaly_type": anomaly_result["anomaly_type"],
+                    "severity": anomaly_result["severity"],
+                },
+                "fft": fft_output,
+                "params": params_output,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            send_result(invalid_result)
+            return invalid_result
+
+        anomaly_detector.update_reference(anomaly_result["features"])
+        _valid_sample_count += 1
+
         send_progress(
             analysis_id,
             "processing",
@@ -174,27 +247,50 @@ def process_thz_waveform(self, task_data: Dict) -> Dict:
             "Predicting moisture content",
         )
 
-        moisture = plsr_predictor.predict(
+        prediction = plsr_predictor.predict_with_details(
             frequencies=params_result["frequencies"],
             absorption_coeff=params_result["absorption_coeff"],
             refractive_index=params_result["refractive_index"],
         )
 
+        moisture = prediction["moisture_content"]
+        total_speedup = prediction.get("speedup_ratio", 1.0) * speedup_fft
+
         send_progress(
             analysis_id,
             "completed",
             100,
-            "Analysis completed successfully",
+            f"Analysis completed successfully, speedup: {total_speedup:.1f}x",
             moisture=moisture,
         )
 
-        return {
+        final_result = {
             "analysis_id": analysis_id,
             "status": "completed",
             "fft": fft_output,
             "params": params_output,
             "moisture_content_percent": moisture,
+            "anomaly_detection": {
+                "is_invalid": False,
+                "anomaly_score": anomaly_result["anomaly_score"],
+                "confidence": anomaly_result["confidence"],
+                "anomaly_type": anomaly_result["anomaly_type"],
+                "severity": anomaly_result["severity"],
+            },
+            "performance": {
+                "fft_speedup": float(speedup_fft),
+                "prediction_speedup": float(prediction.get("speedup_ratio", 1.0)),
+                "total_speedup": float(total_speedup),
+                "prediction_time_ms": float(prediction.get("processing_time_ms", 0)),
+                "valid_samples_processed": _valid_sample_count,
+            },
         }
+
+        send_result(final_result)
+
+        print(f"Task {analysis_id} completed: moisture = {moisture:.4f}%, speedup = {total_speedup:.1f}x")
+
+        return final_result
 
     except Exception as e:
         print(f"Error processing task {analysis_id}: {e}")
