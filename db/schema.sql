@@ -36,9 +36,13 @@ CREATE TABLE IF NOT EXISTS frequency_spectra (
     analysis_id UUID NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
     frequencies JSONB NOT NULL,
     sample_amplitude JSONB NOT NULL,
-    sample_phase JSONB NOT NULL,
+    sample_phase NUMERIC(20,10)[] NOT NULL,
     reference_amplitude JSONB,
-    reference_phase JSONB,
+    reference_phase NUMERIC(20,10)[],
+    sample_real_part NUMERIC(20,10)[],
+    sample_imag_part NUMERIC(20,10)[],
+    reference_real_part NUMERIC(20,10)[],
+    reference_imag_part NUMERIC(20,10)[],
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -106,3 +110,67 @@ CREATE INDEX IF NOT EXISTS idx_cache_md5 ON cache_records(md5);
 CREATE INDEX IF NOT EXISTS idx_cache_analysis ON cache_records(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_name ON metric_records(metric_name);
 CREATE INDEX IF NOT EXISTS idx_metrics_created ON metric_records(created_at DESC);
+
+-- Migration: Fix Float4 precision loss for FFT complex results
+-- Add NUMERIC(20,10)[] columns for phase and complex FFT data
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'frequency_spectra' AND column_name = 'sample_real_part'
+    ) THEN
+        ALTER TABLE frequency_spectra
+            ADD COLUMN sample_real_part NUMERIC(20,10)[],
+            ADD COLUMN sample_imag_part NUMERIC(20,10)[],
+            ADD COLUMN reference_real_part NUMERIC(20,10)[],
+            ADD COLUMN reference_imag_part NUMERIC(20,10)[];
+    END IF;
+END $$;
+
+-- Migrate existing sample_phase from JSONB to NUMERIC(20,10)[]
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'frequency_spectra'
+        AND column_name = 'sample_phase'
+        AND data_type = 'jsonb'
+    ) THEN
+        ALTER TABLE frequency_spectra ADD COLUMN sample_phase_new NUMERIC(20,10)[];
+
+        UPDATE frequency_spectra
+        SET sample_phase_new = ARRAY(
+            SELECT elem::NUMERIC(20,10)
+            FROM jsonb_array_elements_text(sample_phase) AS elem
+        )
+        WHERE sample_phase IS NOT NULL;
+
+        ALTER TABLE frequency_spectra DROP COLUMN sample_phase;
+        ALTER TABLE frequency_spectra RENAME COLUMN sample_phase_new TO sample_phase;
+        ALTER TABLE frequency_spectra ALTER COLUMN sample_phase SET NOT NULL;
+    END IF;
+END $$;
+
+-- Migrate existing reference_phase from JSONB to NUMERIC(20,10)[]
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'frequency_spectra'
+        AND column_name = 'reference_phase'
+        AND data_type = 'jsonb'
+    ) THEN
+        ALTER TABLE frequency_spectra ADD COLUMN reference_phase_new NUMERIC(20,10)[];
+
+        UPDATE frequency_spectra
+        SET reference_phase_new = ARRAY(
+            SELECT elem::NUMERIC(20,10)
+            FROM jsonb_array_elements_text(reference_phase) AS elem
+        )
+        WHERE reference_phase IS NOT NULL;
+
+        ALTER TABLE frequency_spectra DROP COLUMN reference_phase;
+        ALTER TABLE frequency_spectra RENAME COLUMN reference_phase_new TO reference_phase;
+    END IF;
+END $$;

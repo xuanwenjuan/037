@@ -19,11 +19,15 @@ class FFTProcessor:
 
         amplitude = np.abs(fft_pos)
         phase = np.unwrap(np.angle(fft_pos))
+        real_part = np.real(fft_pos)
+        imag_part = np.imag(fft_pos)
 
         return {
             "frequencies": freqs_pos.tolist(),
             "amplitude": amplitude.tolist(),
             "phase": phase.tolist(),
+            "real_part": real_part.tolist(),
+            "imag_part": imag_part.tolist(),
         }
 
     def process_waveform(
@@ -43,6 +47,8 @@ class FFTProcessor:
             "frequencies": sample_result["frequencies"],
             "sample_amplitude": sample_result["amplitude"],
             "sample_phase": sample_result["phase"],
+            "sample_real_part": sample_result["real_part"],
+            "sample_imag_part": sample_result["imag_part"],
         }
 
         if reference_field is not None and len(reference_field) > 0:
@@ -52,6 +58,8 @@ class FFTProcessor:
             ref_result = self.compute_fft(time_arr, ref_windowed)
             result["reference_amplitude"] = ref_result["amplitude"]
             result["reference_phase"] = ref_result["phase"]
+            result["reference_real_part"] = ref_result["real_part"]
+            result["reference_imag_part"] = ref_result["imag_part"]
 
         return result
 

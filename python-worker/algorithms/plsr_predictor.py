@@ -5,9 +5,14 @@ import onnxruntime as ort
 from typing import Dict, List, Optional
 
 from .band_cutter import BandCutter
+from .sinc_resampler import SincResampler
 
 
 class PLSRPredictor:
+    STANDARD_FREQ_MIN_THZ = 0.1
+    STANDARD_FREQ_MAX_THZ = 4.0
+    STANDARD_FREQ_STEP_THZ = 0.01
+
     def __init__(self, model_path: str, use_band_cutting: bool = True):
         self.model_path = model_path
         self.session = None
@@ -19,7 +24,14 @@ class PLSRPredictor:
             max_freq_thz=4.0,
             snr_threshold=3.0,
         )
-        self._target_freqs = np.array([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]) * 1e12
+        self.resampler = SincResampler(
+            freq_min_thz=self.STANDARD_FREQ_MIN_THZ,
+            freq_max_thz=self.STANDARD_FREQ_MAX_THZ,
+            freq_step_thz=self.STANDARD_FREQ_STEP_THZ,
+        )
+        self._standard_freqs = self.resampler.standard_freqs_hz
+        self._num_standard_points = self.resampler.num_standard_points
+        self._target_freqs = self._standard_freqs
         self._load_model()
 
     def _load_model(self) -> None:
@@ -66,33 +78,54 @@ class PLSRPredictor:
     ) -> Dict:
         start_time = time.time()
 
+        resampled = self.resampler.resample_optical_params(
+            frequencies, absorption_coeff, refractive_index
+        )
+        resample_info = resampled["resample_info"]
+
+        cut_freqs = resampled["frequencies"]
+        cut_alpha = resampled["absorption_coeff"]
+        cut_n = resampled["refractive_index"]
+        band_info = {
+            "valid": True,
+            "resampled": True,
+            "standard_freq_min_thz": self.STANDARD_FREQ_MIN_THZ,
+            "standard_freq_max_thz": self.STANDARD_FREQ_MAX_THZ,
+            "standard_freq_step_thz": self.STANDARD_FREQ_STEP_THZ,
+            "standard_num_points": self._num_standard_points,
+        }
+        speedup_ratio = 1.0
+
         if self.use_band_cutting:
             cut_result = self.band_cutter.cut_params(
-                frequencies, absorption_coeff, refractive_index
+                cut_freqs, cut_alpha, cut_n
             )
-            cut_freqs = cut_result["frequencies"]
-            cut_alpha = cut_result["absorption_coeff"]
-            cut_n = cut_result["refractive_index"]
-            band_info = cut_result["band_info"]
-            speedup_ratio = cut_result["speedup_ratio"]
+            if cut_result["band_info"]["valid"] and len(cut_result["frequencies"]) >= 5:
+                cut_freqs = cut_result["frequencies"]
+                cut_alpha = cut_result["absorption_coeff"]
+                cut_n = cut_result["refractive_index"]
+                band_info = cut_result["band_info"]
+                band_info["resampled"] = True
+                speedup_ratio = cut_result["speedup_ratio"]
+            else:
+                band_info["band_cutting_skipped"] = True
+                band_info["band_cutting_reason"] = "insufficient_valid_points_after_resampling"
 
-            if not band_info["valid"] or len(cut_freqs) < 5:
-                return {
-                    "moisture_content": 0.0,
-                    "valid": False,
-                    "band_info": band_info,
-                    "processing_time_ms": 0.0,
-                    "speedup_ratio": 1.0,
-                    "error": "No valid frequency band for prediction",
-                }
-        else:
-            cut_freqs = frequencies
-            cut_alpha = absorption_coeff
-            cut_n = refractive_index
-            band_info = None
-            speedup_ratio = 1.0
+        alpha_arr = np.array(cut_alpha, dtype=np.float64)
+        n_arr = np.array(cut_n, dtype=np.float64)
 
-        features = self._extract_features(cut_freqs, cut_alpha, cut_n)
+        if len(alpha_arr) < 3 or not np.any(np.isfinite(alpha_arr)):
+            return {
+                "moisture_content": 0.0,
+                "valid": False,
+                "band_info": band_info,
+                "processing_time_ms": 0.0,
+                "speedup_ratio": speedup_ratio,
+                "error": "No valid spectral data after resampling",
+                "resample_info": resample_info,
+            }
+
+        features = self._extract_features_from_resampled(alpha_arr, n_arr)
 
         if self.session is not None:
             moisture = self._predict_onnx(features)
@@ -108,20 +141,16 @@ class PLSRPredictor:
             "processing_time_ms": processing_time,
             "speedup_ratio": speedup_ratio,
             "feature_dim": features.shape[1],
+            "resample_info": resample_info,
         }
 
-    def _extract_features(
+    def _extract_features_from_resampled(
         self,
-        frequencies: List[float],
-        absorption_coeff: List[float],
-        refractive_index: List[float],
+        alpha_arr: np.ndarray,
+        n_arr: np.ndarray,
     ) -> np.ndarray:
-        freq_arr = np.array(frequencies)
-        alpha_arr = np.array(absorption_coeff)
-        n_arr = np.array(refractive_index)
-
-        alpha_interp = self._interpolate(freq_arr, alpha_arr, self._target_freqs)
-        n_interp = self._interpolate(freq_arr, n_arr, self._target_freqs)
+        alpha_interp = self._resample_to_target(alpha_arr)
+        n_interp = self._resample_to_target(n_arr)
 
         alpha_stats = self._compute_stats(alpha_arr)
         n_stats = self._compute_stats(n_arr)
@@ -130,11 +159,43 @@ class PLSRPredictor:
 
         return features.reshape(1, -1).astype(np.float32)
 
-    def _interpolate(self, x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
-        mask = np.isfinite(y)
+    def _resample_to_target(self, values: np.ndarray) -> np.ndarray:
+        if len(values) == self._num_standard_points:
+            mask = np.isfinite(values)
+            result = values.copy()
+            result[~mask] = 0.0
+            return result
+
+        if len(values) == 0:
+            return np.zeros(self._num_standard_points)
+
+        mask = np.isfinite(values)
         if not np.any(mask):
-            return np.zeros_like(x_new)
-        return np.interp(x_new, x[mask], y[mask], left=y[mask][0], right=y[mask][-1])
+            return np.zeros(self._num_standard_points)
+
+        valid_vals = values[mask]
+        step = max(1, len(valid_vals) // self._num_standard_points)
+        sampled = valid_vals[::step][:self._num_standard_points]
+
+        if len(sampled) < self._num_standard_points:
+            padded = np.zeros(self._num_standard_points)
+            padded[:len(sampled)] = sampled
+            return padded
+
+        return sampled
+
+    def _extract_features(
+        self,
+        frequencies: List[float],
+        absorption_coeff: List[float],
+        refractive_index: List[float],
+    ) -> np.ndarray:
+        resampled = self.resampler.resample_optical_params(
+            frequencies, absorption_coeff, refractive_index
+        )
+        alpha_arr = np.array(resampled["absorption_coeff"], dtype=np.float64)
+        n_arr = np.array(resampled["refractive_index"], dtype=np.float64)
+        return self._extract_features_from_resampled(alpha_arr, n_arr)
 
     def _compute_stats(self, arr: np.ndarray) -> np.ndarray:
         valid = arr[np.isfinite(arr)]

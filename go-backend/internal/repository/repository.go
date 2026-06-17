@@ -152,13 +152,12 @@ func (r *Repository) GetAnalysisDetail(analysisID string) (*models.AnalysisDetai
 func (r *Repository) SaveFFTResult(analysisID string, fft *models.FFTResult) error {
 	freqJSON, _ := json.Marshal(fft.Frequencies)
 	ampJSON, _ := json.Marshal(fft.SampleAmplitude)
-	phaseJSON, _ := json.Marshal(fft.SamplePhase)
 
 	fs := &models.FrequencySpectrum{
 		AnalysisID:      analysisID,
 		Frequencies:     datatypes.JSON(freqJSON),
 		SampleAmplitude: datatypes.JSON(ampJSON),
-		SamplePhase:     datatypes.JSON(phaseJSON),
+		SamplePhase:     models.NumericArray(fft.SamplePhase),
 	}
 
 	if fft.ReferenceAmplitude != nil {
@@ -166,8 +165,19 @@ func (r *Repository) SaveFFTResult(analysisID string, fft *models.FFTResult) err
 		fs.ReferenceAmplitude = datatypes.JSON(refAmpJSON)
 	}
 	if fft.ReferencePhase != nil {
-		refPhaseJSON, _ := json.Marshal(fft.ReferencePhase)
-		fs.ReferencePhase = datatypes.JSON(refPhaseJSON)
+		fs.ReferencePhase = models.NumericArray(fft.ReferencePhase)
+	}
+	if fft.SampleRealPart != nil {
+		fs.SampleRealPart = models.NumericArray(fft.SampleRealPart)
+	}
+	if fft.SampleImagPart != nil {
+		fs.SampleImagPart = models.NumericArray(fft.SampleImagPart)
+	}
+	if fft.ReferenceRealPart != nil {
+		fs.ReferenceRealPart = models.NumericArray(fft.ReferenceRealPart)
+	}
+	if fft.ReferenceImagPart != nil {
+		fs.ReferenceImagPart = models.NumericArray(fft.ReferenceImagPart)
 	}
 
 	return r.db.Transaction(func(tx *gorm.DB) error {
@@ -305,13 +315,12 @@ func (r *Repository) upsertFFTResult(tx *gorm.DB, analysisID string, fft *models
 
 	freqJSON, _ := json.Marshal(fft.Frequencies)
 	ampJSON, _ := json.Marshal(fft.SampleAmplitude)
-	phaseJSON, _ := json.Marshal(fft.SamplePhase)
 
 	fs := &models.FrequencySpectrum{
 		AnalysisID:      analysisID,
 		Frequencies:     datatypes.JSON(freqJSON),
 		SampleAmplitude: datatypes.JSON(ampJSON),
-		SamplePhase:     datatypes.JSON(phaseJSON),
+		SamplePhase:     models.NumericArray(fft.SamplePhase),
 	}
 
 	if fft.ReferenceAmplitude != nil {
@@ -319,8 +328,19 @@ func (r *Repository) upsertFFTResult(tx *gorm.DB, analysisID string, fft *models
 		fs.ReferenceAmplitude = datatypes.JSON(refAmpJSON)
 	}
 	if fft.ReferencePhase != nil {
-		refPhaseJSON, _ := json.Marshal(fft.ReferencePhase)
-		fs.ReferencePhase = datatypes.JSON(refPhaseJSON)
+		fs.ReferencePhase = models.NumericArray(fft.ReferencePhase)
+	}
+	if fft.SampleRealPart != nil {
+		fs.SampleRealPart = models.NumericArray(fft.SampleRealPart)
+	}
+	if fft.SampleImagPart != nil {
+		fs.SampleImagPart = models.NumericArray(fft.SampleImagPart)
+	}
+	if fft.ReferenceRealPart != nil {
+		fs.ReferenceRealPart = models.NumericArray(fft.ReferenceRealPart)
+	}
+	if fft.ReferenceImagPart != nil {
+		fs.ReferenceImagPart = models.NumericArray(fft.ReferenceImagPart)
 	}
 
 	return tx.Create(fs).Error

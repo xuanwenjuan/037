@@ -1,10 +1,64 @@
 package models
 
 import (
+	"database/sql/driver"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"gorm.io/datatypes"
 )
+
+type NumericArray []float64
+
+func (a NumericArray) Value() (driver.Value, error) {
+	if a == nil {
+		return nil, nil
+	}
+	parts := make([]string, len(a))
+	for i, v := range a {
+		parts[i] = fmt.Sprintf("%.10f", v)
+	}
+	return "{" + strings.Join(parts, ",") + "}", nil
+}
+
+func (a *NumericArray) Scan(value interface{}) error {
+	if value == nil {
+		*a = nil
+		return nil
+	}
+
+	var s string
+	switch v := value.(type) {
+	case string:
+		s = v
+	case []byte:
+		s = string(v)
+	default:
+		return fmt.Errorf("cannot scan %T into NumericArray", value)
+	}
+
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+
+	if s == "" {
+		*a = NumericArray{}
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+	result := make(NumericArray, len(parts))
+	for i, part := range parts {
+		val, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil {
+			return fmt.Errorf("failed to parse numeric array element %q: %w", part, err)
+		}
+		result[i] = val
+	}
+	*a = result
+	return nil
+}
 
 type AnalysisStatus string
 
@@ -55,9 +109,13 @@ type FrequencySpectrum struct {
 	AnalysisID        string         `gorm:"type:uuid;not null" json:"analysis_id"`
 	Frequencies       datatypes.JSON `gorm:"type:jsonb;not null" json:"frequencies"`
 	SampleAmplitude   datatypes.JSON `gorm:"type:jsonb;not null" json:"sample_amplitude"`
-	SamplePhase       datatypes.JSON `gorm:"type:jsonb;not null" json:"sample_phase"`
+	SamplePhase       NumericArray   `gorm:"type:numeric(20,10)[];not null" json:"sample_phase"`
 	ReferenceAmplitude datatypes.JSON `gorm:"type:jsonb" json:"reference_amplitude,omitempty"`
-	ReferencePhase    datatypes.JSON `gorm:"type:jsonb" json:"reference_phase,omitempty"`
+	ReferencePhase    NumericArray   `gorm:"type:numeric(20,10)[]" json:"reference_phase,omitempty"`
+	SampleRealPart    NumericArray   `gorm:"type:numeric(20,10)[]" json:"sample_real_part,omitempty"`
+	SampleImagPart    NumericArray   `gorm:"type:numeric(20,10)[]" json:"sample_imag_part,omitempty"`
+	ReferenceRealPart NumericArray   `gorm:"type:numeric(20,10)[]" json:"reference_real_part,omitempty"`
+	ReferenceImagPart NumericArray   `gorm:"type:numeric(20,10)[]" json:"reference_imag_part,omitempty"`
 	CreatedAt         time.Time      `json:"created_at"`
 }
 
@@ -111,6 +169,10 @@ type FFTResult struct {
 	SamplePhase        []float64  `json:"sample_phase"`
 	ReferenceAmplitude []float64  `json:"reference_amplitude,omitempty"`
 	ReferencePhase     []float64  `json:"reference_phase,omitempty"`
+	SampleRealPart     []float64  `json:"sample_real_part,omitempty"`
+	SampleImagPart     []float64  `json:"sample_imag_part,omitempty"`
+	ReferenceRealPart  []float64  `json:"reference_real_part,omitempty"`
+	ReferenceImagPart  []float64  `json:"reference_imag_part,omitempty"`
 	BandInfo           *BandInfo  `json:"band_info,omitempty"`
 	SpeedupRatio       float64    `json:"speedup_ratio"`
 }
