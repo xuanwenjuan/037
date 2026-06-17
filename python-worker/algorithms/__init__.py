@@ -3,6 +3,7 @@ from .dorney_duvillaret import DorneyDuvillaret
 from .plsr_predictor import PLSRPredictor
 from .band_cutter import BandCutter
 from .anomaly_detector import AnomalyDetector
+from .differential_analyzer import DifferentialAnalyzer, TimePointData
 
 __all__ = [
     "FFTProcessor",
@@ -10,4 +11,6 @@ __all__ = [
     "PLSRPredictor",
     "BandCutter",
     "AnomalyDetector",
+    "DifferentialAnalyzer",
+    "TimePointData",
 ]

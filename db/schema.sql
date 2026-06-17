@@ -59,3 +59,50 @@ CREATE INDEX IF NOT EXISTS idx_analyses_anomaly_severity ON analyses(anomaly_sev
 CREATE INDEX IF NOT EXISTS idx_waveforms_analysis ON raw_waveforms(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_spectra_analysis ON frequency_spectra(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_params_analysis ON optical_params(analysis_id);
+
+CREATE TABLE IF NOT EXISTS differential_comparisons (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    material_type VARCHAR(100) NOT NULL,
+    sample_thickness_mm FLOAT NOT NULL,
+    analysis_id_t1 UUID NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    analysis_id_t2 UUID NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    time_interval_hours FLOAT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    migration_rate_per_hour FLOAT,
+    delta_moisture FLOAT,
+    moisture_t1 FLOAT,
+    moisture_t2 FLOAT,
+    difference_spectrum JSONB,
+    drying_efficiency FLOAT,
+    half_life_hours FLOAT,
+    error_message TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS cache_records (
+    id VARCHAR(64) PRIMARY KEY,
+    md5 VARCHAR(32) UNIQUE NOT NULL,
+    analysis_id UUID NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    time_points_hash VARCHAR(64) NOT NULL,
+    sample_field_hash VARCHAR(64) NOT NULL,
+    hit_count INTEGER DEFAULT 0,
+    last_accessed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS metric_records (
+    id BIGSERIAL PRIMARY KEY,
+    metric_name VARCHAR(100) NOT NULL,
+    metric_value FLOAT NOT NULL,
+    labels JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_diff_comparisons_status ON differential_comparisons(status);
+CREATE INDEX IF NOT EXISTS idx_diff_comparisons_material ON differential_comparisons(material_type);
+CREATE INDEX IF NOT EXISTS idx_diff_comparisons_created ON differential_comparisons(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cache_md5 ON cache_records(md5);
+CREATE INDEX IF NOT EXISTS idx_cache_analysis ON cache_records(analysis_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_name ON metric_records(metric_name);
+CREATE INDEX IF NOT EXISTS idx_metrics_created ON metric_records(created_at DESC);

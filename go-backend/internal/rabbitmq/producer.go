@@ -12,9 +12,10 @@ type Producer struct {
 	conn      *amqp.Connection
 	channel   *amqp.Channel
 	taskQueue string
+	diffQueue string
 }
 
-func NewProducer(url, taskQueue string) (*Producer, error) {
+func NewProducer(url, taskQueue, diffQueue string) (*Producer, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -37,13 +38,21 @@ func NewProducer(url, taskQueue string) (*Producer, error) {
 	if err != nil {
 		ch.Close()
 		conn.Close()
-		return nil, fmt.Errorf("failed to declare queue: %w", err)
+		return nil, fmt.Errorf("failed to declare task queue: %w", err)
+	}
+
+	_, err = ch.QueueDeclare(diffQueue, true, false, false, false, nil)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare diff queue: %w", err)
 	}
 
 	return &Producer{
 		conn:      conn,
 		channel:   ch,
 		taskQueue: taskQueue,
+		diffQueue: diffQueue,
 	}, nil
 }
 
@@ -69,6 +78,46 @@ func (p *Producer) PublishTask(task *models.TaskMessage) error {
 	}
 
 	return nil
+}
+
+func (p *Producer) PublishDifferentialTask(task *models.DifferentialTask) error {
+	body, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("failed to marshal differential task: %w", err)
+	}
+
+	err = p.channel.Publish(
+		"",
+		p.diffQueue,
+		false,
+		false,
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "application/json",
+			Body:         body,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to publish differential task: %w", err)
+	}
+
+	return nil
+}
+
+func (p *Producer) GetQueueDepth(queueName string) (int, error) {
+	q, err := p.channel.QueueInspect(queueName)
+	if err != nil {
+		return 0, fmt.Errorf("failed to inspect queue: %w", err)
+	}
+	return q.Messages, nil
+}
+
+func (p *Producer) GetTaskQueueDepth() (int, error) {
+	return p.GetQueueDepth(p.taskQueue)
+}
+
+func (p *Producer) GetDiffQueueDepth() (int, error) {
+	return p.GetQueueDepth(p.diffQueue)
 }
 
 func (p *Producer) Close() error {

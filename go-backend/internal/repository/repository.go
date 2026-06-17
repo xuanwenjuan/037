@@ -27,6 +27,22 @@ func New(host string, port int, user, password, dbname string) (*Repository, err
 	return &Repository{db: db}, nil
 }
 
+func (r *Repository) Begin() *Repository {
+	return &Repository{db: r.db.Begin()}
+}
+
+func (r *Repository) Commit() error {
+	return r.db.Commit().Error
+}
+
+func (r *Repository) Rollback() error {
+	return r.db.Rollback().Error
+}
+
+func (r *Repository) DB() *gorm.DB {
+	return r.db
+}
+
 func (r *Repository) CreateAnalysis(analysis *models.Analysis) error {
 	return r.db.Create(analysis).Error
 }
@@ -334,4 +350,113 @@ func (r *Repository) upsertParamsResult(tx *gorm.DB, analysisID string, params *
 	}
 
 	return tx.Create(op).Error
+}
+
+func (r *Repository) CreateDifferentialComparison(dc *models.DifferentialComparison) error {
+	return r.db.Create(dc).Error
+}
+
+func (r *Repository) GetDifferentialComparison(id string) (*models.DifferentialComparison, error) {
+	var dc models.DifferentialComparison
+	err := r.db.Where("id = ?", id).First(&dc).Error
+	if err != nil {
+		return nil, err
+	}
+	return &dc, nil
+}
+
+func (r *Repository) ListDifferentialComparisons(limit, offset int) ([]models.DifferentialComparison, int64, error) {
+	var comparisons []models.DifferentialComparison
+	var total int64
+
+	r.db.Model(&models.DifferentialComparison{}).Count(&total)
+	err := r.db.Order("created_at DESC").Limit(limit).Offset(offset).Find(&comparisons).Error
+	return comparisons, total, err
+}
+
+func (r *Repository) UpdateDifferentialResult(dcID string, result *models.DifferentialResult) error {
+	diffSpecJSON, _ := json.Marshal(result.DifferenceSpectrum)
+
+	updates := map[string]interface{}{
+		"status":               models.StatusCompleted,
+		"migration_rate_per_hour": result.MigrationRate,
+		"delta_moisture":       result.DeltaMoisture,
+		"moisture_t1":          result.MoistureT1,
+		"moisture_t2":          result.MoistureT2,
+		"drying_efficiency":    result.DryingEfficiency,
+		"completed_at":         time.Now(),
+	}
+
+	if result.HalfLifeHours != nil {
+		updates["half_life_hours"] = *result.HalfLifeHours
+	}
+	if result.DifferenceSpectrum != nil {
+		updates["difference_spectrum"] = datatypes.JSON(diffSpecJSON)
+	}
+
+	return r.db.Model(&models.DifferentialComparison{}).Where("id = ?", dcID).Updates(updates).Error
+}
+
+func (r *Repository) UpdateDifferentialStatus(dcID string, status models.AnalysisStatus, errMsg string) error {
+	updates := map[string]interface{}{"status": status}
+	if errMsg != "" {
+		updates["error_message"] = errMsg
+	}
+	if status == models.StatusCompleted || status == models.StatusFailed || status == models.StatusInvalid {
+		updates["completed_at"] = time.Now()
+	}
+	return r.db.Model(&models.DifferentialComparison{}).Where("id = ?", dcID).Updates(updates).Error
+}
+
+func (r *Repository) CreateCacheRecord(cr *models.CacheRecord) error {
+	return r.db.Create(cr).Error
+}
+
+func (r *Repository) GetCacheRecordByMD5(md5 string) (*models.CacheRecord, error) {
+	var cr models.CacheRecord
+	err := r.db.Where("md5 = ?", md5).First(&cr).Error
+	if err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+func (r *Repository) IncrementCacheHit(md5 string) error {
+	return r.db.Model(&models.CacheRecord{}).Where("md5 = ?", md5).
+		Updates(map[string]interface{}{
+			"hit_count":      gorm.Expr("hit_count + 1"),
+			"last_accessed_at": time.Now(),
+		}).Error
+}
+
+func (r *Repository) GetDifferentialComparisonDetail(id string) (*models.DifferentialComparisonDetail, error) {
+	dc, err := r.GetDifferentialComparison(id)
+	if err != nil {
+		return nil, err
+	}
+
+	detail := &models.DifferentialComparisonDetail{Comparison: dc}
+
+	if a1, err := r.GetAnalysisDetail(dc.AnalysisID_T1); err == nil {
+		detail.AnalysisT1 = a1
+	}
+	if a2, err := r.GetAnalysisDetail(dc.AnalysisID_T2); err == nil {
+		detail.AnalysisT2 = a2
+	}
+
+	if dc.MigrationRate != nil {
+		detail.Result = &models.DifferentialResult{
+			MigrationRate:    *dc.MigrationRate,
+			DeltaMoisture:    *dc.DeltaMoisture,
+			MoistureT1:       *dc.MoistureT1,
+			MoistureT2:       *dc.MoistureT2,
+			DryingEfficiency: *dc.DryingEfficiency,
+			IsDrying:         *dc.MoistureT2 < *dc.MoistureT1,
+		}
+		if dc.HalfLifeHours != nil {
+			detail.Result.HalfLifeHours = dc.HalfLifeHours
+		}
+	}
+
+	return detail, nil
 }

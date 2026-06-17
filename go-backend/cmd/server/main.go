@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"thz-service/internal/cache"
 	"thz-service/internal/config"
 	"thz-service/internal/handlers"
+	"thz-service/internal/metrics"
 	"thz-service/internal/rabbitmq"
 	"thz-service/internal/repository"
 	"thz-service/internal/websocket"
@@ -31,7 +33,24 @@ func main() {
 	}
 	log.Println("Database connected successfully")
 
-	producer, err := rabbitmq.NewProducer(cfg.RabbitMQURL, cfg.RabbitMQQueue)
+	var cacheSvc *cache.CacheService
+	if cfg.EnableCache {
+		cacheSvc, err = cache.NewCacheService(cfg.RedisURL, cfg.CacheTTL)
+		if err != nil {
+			log.Printf("WARNING: Failed to connect to Redis, cache disabled: %v", err)
+			cacheSvc = nil
+		} else {
+			log.Println("Redis cache connected successfully")
+		}
+	}
+
+	var metricsCollector *metrics.MetricsCollector
+	if cfg.EnableMetrics {
+		metricsCollector = metrics.NewMetricsCollector()
+		log.Println("Prometheus metrics collector initialized")
+	}
+
+	producer, err := rabbitmq.NewProducer(cfg.RabbitMQURL, cfg.RabbitMQQueue, cfg.RabbitMQDiff)
 	if err != nil {
 		log.Fatalf("Failed to create RabbitMQ producer: %v", err)
 	}
@@ -40,7 +59,7 @@ func main() {
 
 	wsMgr := websocket.NewManager(cfg.WSBuffer)
 
-	consumer, err := rabbitmq.NewResultConsumer(cfg.RabbitMQURL, cfg.RabbitMQResult, repo, wsMgr)
+	consumer, err := rabbitmq.NewResultConsumer(cfg.RabbitMQURL, cfg.RabbitMQResult, repo, wsMgr, metricsCollector)
 	if err != nil {
 		log.Fatalf("Failed to create RabbitMQ consumer: %v", err)
 	}
@@ -51,7 +70,24 @@ func main() {
 	}
 	log.Println("RabbitMQ result consumer started")
 
-	h := handlers.NewHandler(repo, producer)
+	if metricsCollector != nil {
+		consumer.StartQueueMonitor(producer, cfg.RabbitMQResult, 5*time.Second)
+		log.Println("Queue monitor started")
+	}
+
+	diffConsumer, err := rabbitmq.NewDiffResultConsumer(cfg.RabbitMQURL, cfg.RabbitMQDiff+"_results", repo, wsMgr, metricsCollector)
+	if err != nil {
+		log.Printf("WARNING: Failed to create diff result consumer: %v", err)
+	} else {
+		if err := diffConsumer.Start(); err != nil {
+			log.Printf("WARNING: Failed to start diff consumer: %v", err)
+		} else {
+			defer diffConsumer.Stop()
+			log.Println("RabbitMQ diff result consumer started")
+		}
+	}
+
+	h := handlers.NewHandler(repo, producer, cacheSvc, metricsCollector, cfg.EnableCache && cacheSvc != nil)
 
 	r := gin.Default()
 
@@ -68,15 +104,45 @@ func main() {
 	{
 		api.GET("/health", h.HealthCheck)
 		api.POST("/analyses/upload", h.UploadWaveform)
+		api.POST("/analyses/batch-upload", h.BatchUpload)
 		api.GET("/analyses", h.ListAnalyses)
 		api.GET("/analyses/:id", h.GetAnalysis)
 		api.GET("/analyses/:id/ws", wsMgr.HandleConnection)
+
+		api.POST("/differential/compare", h.DifferentialCompare)
+		api.GET("/differential", h.ListDifferentialComparisons)
+		api.GET("/differential/:id", h.GetDifferentialComparison)
+
+		api.GET("/cache/stats", h.GetCacheStats)
+		api.GET("/metrics/summary", h.GetMetricsSummary)
+	}
+
+	if metricsCollector != nil {
+		r.GET("/metrics", gin.WrapH(metricsCollector.Handler()))
+		log.Printf("Prometheus metrics endpoint available at /metrics")
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.ServerPort)
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: r,
+	}
+
+	var metricsSrv *http.Server
+	if cfg.EnableMetrics && metricsCollector != nil {
+		metricsAddr := fmt.Sprintf(":%d", cfg.MetricsPort)
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", metricsCollector.Handler())
+		metricsSrv = &http.Server{
+			Addr:    metricsAddr,
+			Handler: metricsMux,
+		}
+		go func() {
+			log.Printf("Metrics server starting on %s", metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("Metrics server error: %v", err)
+			}
+		}()
 	}
 
 	go func() {
@@ -93,6 +159,11 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	if metricsSrv != nil {
+		metricsSrv.Shutdown(ctx)
+	}
+
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
